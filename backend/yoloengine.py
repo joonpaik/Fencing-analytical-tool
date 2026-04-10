@@ -83,6 +83,38 @@ class PersonPose:
 
 
 # ---------------------------------------------------------------------------
+# Temporal smoother
+# ---------------------------------------------------------------------------
+
+class PoseSmoother:
+    """
+    Per-track EMA smoother for keypoint (x, y) coordinates.
+    Confidence values are kept raw so visibility thresholds are unaffected.
+    """
+
+    def __init__(self, alpha: float = 0.4):
+        self.alpha = alpha
+        self._state: dict = {}  # track_id -> smoothed (N, 3) np.ndarray
+
+    def smooth(self, track_id: int, kp: np.ndarray) -> np.ndarray:
+        if track_id not in self._state:
+            self._state[track_id] = kp.copy()
+            return kp
+        prev = self._state[track_id]
+        out = prev.copy()
+        out[:, :2] = self.alpha * kp[:, :2] + (1 - self.alpha) * prev[:, :2]
+        out[:, 2]  = kp[:, 2]          # keep raw confidence
+        self._state[track_id] = out
+        return out
+
+    def prune(self, active_ids: set):
+        """Remove state for track IDs no longer present in the frame."""
+        for tid in list(self._state):
+            if tid not in active_ids:
+                del self._state[tid]
+
+
+# ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------
 
@@ -179,10 +211,20 @@ def _draw_skeleton_coco(frame, kp: np.ndarray,
                         line_colour=(0, 255, 0)):
     # Draw a single centroid point for all visible head keypoints
     head_pts = [(kp[i][0], kp[i][1]) for i in HEAD_KP_INDICES if kp[i][2] > 0.05]
+    head_centre = None
     if head_pts:
         cx = int(sum(p[0] for p in head_pts) / len(head_pts))
         cy = int(sum(p[1] for p in head_pts) / len(head_pts))
-        cv2.circle(frame, (cx, cy), 5, dot_colour, -1)
+        head_centre = (cx, cy)
+        cv2.circle(frame, head_centre, 5, dot_colour, -1)
+
+    # Connect head centroid to each visible shoulder (indices 5, 6)
+    if head_centre is not None:
+        for shoulder_idx in (5, 6):
+            if kp[shoulder_idx][2] > 0.05:
+                cv2.line(frame, head_centre,
+                         (int(kp[shoulder_idx][0]), int(kp[shoulder_idx][1])),
+                         line_colour, 2)
 
     # Draw body keypoints (indices 5+)
     for x, y, conf in kp[5:]:
@@ -233,6 +275,7 @@ class YoloPoseEngine:
                 raise FileNotFoundError(f"YOLO pose model not found: {pt_path}")
             self._yolo = YOLO(str(pt_path))
             self._pose_detector = None
+            self._smoother = PoseSmoother()
             print(f"[YoloPoseEngine] mode=yolo_pose  model={pt_name}")
 
         else:  # yolo_mediapipe
@@ -262,6 +305,7 @@ class YoloPoseEngine:
                 min_tracking_confidence=0.3,
             )
             self._pose_detector = PoseLandmarker.create_from_options(opts)
+            self._smoother = PoseSmoother()
             print(f"[YoloPoseEngine] mode=yolo_mediapipe  det=yolo26n-pose.pt  pose={task_name}")
 
     # ------------------------------------------------------------------
@@ -371,12 +415,18 @@ class YoloPoseEngine:
         results = self._yolo.track(frame, persist=True, conf=0.25, verbose=False)
         poses   = []
 
+        active_ids = set()
+
         for r in results:
             if r.keypoints is None:
                 continue
             for i, box in enumerate(r.boxes.xyxy):
                 x1, y1, x2, y2 = map(int, box)
+                track_id = int(r.boxes.id[i]) if r.boxes.id is not None else i
+                active_ids.add(track_id)
+
                 kp_data = r.keypoints.data[i].cpu().numpy()   # (17, 3): x, y, conf
+                kp_data = self._smoother.smooth(track_id, kp_data)
 
                 angles = _extract_angles_coco(kp_data)
                 pose   = PersonPose(
@@ -386,6 +436,7 @@ class YoloPoseEngine:
                 )
                 poses.append(pose)
 
+        self._smoother.prune(active_ids)
         return poses
 
     def _process_yolo_mediapipe(self, frame: np.ndarray) -> List[PersonPose]:
@@ -395,11 +446,14 @@ class YoloPoseEngine:
           2. MediaPipe PoseLandmarker runs on each cropped region.
         """
         results = self._yolo.track(frame, persist=True, conf=0.25, verbose=False)
-        poses   = []
+        poses      = []
+        active_ids = set()
 
         for r in results:
-            for box in r.boxes.xyxy:
+            for i, box in enumerate(r.boxes.xyxy):
                 x1, y1, x2, y2 = map(int, box)
+                track_id = int(r.boxes.id[i]) if r.boxes.id is not None else i
+                active_ids.add(track_id)
                 crop = frame[y1:y2, x1:x2]
                 if crop.size == 0:
                     continue
@@ -415,10 +469,11 @@ class YoloPoseEngine:
                 landmarks = det.pose_landmarks[0]   # first person in crop
 
                 # Convert crop-relative landmarks to full-frame pixel coords
-                kp_full = [
-                    (lm.x * cw + x1, lm.y * ch + y1, lm.visibility)
-                    for lm in landmarks
-                ]
+                kp_arr = np.array(
+                    [(lm.x * cw + x1, lm.y * ch + y1, lm.visibility) for lm in landmarks],
+                    dtype=np.float32,
+                )
+                kp_arr = self._smoother.smooth(track_id, kp_arr)
 
                 angles = _extract_angles_mp(landmarks, cw, ch)
                 # Translate hip_center_x to full-frame coords
@@ -426,11 +481,12 @@ class YoloPoseEngine:
 
                 pose = PersonPose(
                     box=(x1, y1, x2, y2),
-                    keypoints=kp_full,
+                    keypoints=kp_arr.tolist(),
                     **angles,
                 )
                 poses.append(pose)
 
+        self._smoother.prune(active_ids)
         return poses
 
 
