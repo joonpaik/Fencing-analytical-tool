@@ -1,1 +1,9 @@
 python-dotenv
+opencv-python
+numpy
+mediapipe # need to uninstall
+torch 
+torchvision
+ultralytics
+ffmpeg-python
+imageio-ffmpeg>=0.4.8
