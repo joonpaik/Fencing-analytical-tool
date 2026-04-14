@@ -87,66 +87,41 @@ class PersonPose:
 # Swap detection + temporal smoother
 # ---------------------------------------------------------------------------
 
-# Upper-body pairs: use x-crossover logic (arms don't genuinely cross in fencing)
-_UPPER_PAIRS = [
+# All symmetric pairs — distance-based assignment applied to every pair.
+# Fencers stand side-on to the camera, so x-ordering is unreliable for both
+# arms (stacked front/back at nearly the same x) and legs (cross during lunges).
+# Distance-based is the only robust strategy: assign each new detection to
+# whichever previous position it is closest to.
+_ALL_PAIRS = [
     (5,  6),   # shoulders
     (7,  8),   # elbows
     (9,  10),  # wrists
-]
-
-# Lower-body pairs: use distance-based assignment (legs DO genuinely cross)
-_LOWER_PAIRS = [
     (11, 12),  # hips
     (13, 14),  # knees
     (15, 16),  # ankles
 ]
 
-_SWAP_DEADBAND = 15.0   # px — ignore x-crossovers when joints are this close
-
 
 def _detect_and_fix_swaps(kp_new: np.ndarray, kp_prev: np.ndarray,
                            conf_thresh: float = 0.2) -> np.ndarray:
     """
-    Correct left/right label confusion using two strategies:
+    For every symmetric pair, choose the assignment (keep or swap) that
+    minimises total Euclidean distance from the previous smoothed positions.
 
-    Upper body (shoulders/elbows/wrists) — x-crossover with deadband:
-      Arms don't genuinely cross in fencing, so a flip in x-order means a
-      YOLO label swap. Ignore crossovers smaller than _SWAP_DEADBAND px to
-      avoid false corrections when nearly parallel to camera.
-
-    Lower body (hips/knees/ankles) — distance-based assignment:
-      Legs DO cross during lunges and footwork, so x-order is meaningless.
-      Instead, assign each current detection to whichever previous position
-      it's closest to. This keeps each joint tracking its own limb regardless
-      of which side of the body it's on.
+    This handles both arms (side-on stacking) and legs (genuine crossing)
+    with the same logic, without any x-ordering assumptions.
     """
     kp = kp_new.copy()
-
-    # --- upper body: x-crossover ---
-    for l, r in _UPPER_PAIRS:
+    for l, r in _ALL_PAIRS:
         if (kp[l, 2] < conf_thresh or kp[r, 2] < conf_thresh or
                 kp_prev[l, 2] < conf_thresh or kp_prev[r, 2] < conf_thresh):
             continue
-        if abs(kp[l, 0] - kp[r, 0]) < _SWAP_DEADBAND:
-            continue
-        prev_l_was_left = kp_prev[l, 0] < kp_prev[r, 0]
-        curr_l_is_left  = kp[l, 0]      < kp[r, 0]
-        if prev_l_was_left != curr_l_is_left:
-            kp[[l, r]] = kp[[r, l]]
-
-    # --- lower body: distance-based assignment ---
-    for l, r in _LOWER_PAIRS:
-        if (kp[l, 2] < conf_thresh or kp[r, 2] < conf_thresh or
-                kp_prev[l, 2] < conf_thresh or kp_prev[r, 2] < conf_thresh):
-            continue
-        # Cost of keeping current assignment vs swapping
         cost_keep = (np.linalg.norm(kp[l, :2] - kp_prev[l, :2]) +
                      np.linalg.norm(kp[r, :2] - kp_prev[r, :2]))
         cost_swap = (np.linalg.norm(kp[r, :2] - kp_prev[l, :2]) +
                      np.linalg.norm(kp[l, :2] - kp_prev[r, :2]))
         if cost_swap < cost_keep:
             kp[[l, r]] = kp[[r, l]]
-
     return kp
 
 
