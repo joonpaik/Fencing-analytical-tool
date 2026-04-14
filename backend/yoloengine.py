@@ -11,6 +11,7 @@ Two operating modes (set via `mode` argument):
 
 import cv2
 import math
+import time
 import numpy as np
 import mediapipe as mp
 from dataclasses import dataclass
@@ -83,28 +84,156 @@ class PersonPose:
 
 
 # ---------------------------------------------------------------------------
-# Temporal smoother
+# Swap detection + temporal smoother
 # ---------------------------------------------------------------------------
+
+# Upper-body pairs: use x-crossover logic (arms don't genuinely cross in fencing)
+_UPPER_PAIRS = [
+    (5,  6),   # shoulders
+    (7,  8),   # elbows
+    (9,  10),  # wrists
+]
+
+# Lower-body pairs: use distance-based assignment (legs DO genuinely cross)
+_LOWER_PAIRS = [
+    (11, 12),  # hips
+    (13, 14),  # knees
+    (15, 16),  # ankles
+]
+
+_SWAP_DEADBAND = 15.0   # px — ignore x-crossovers when joints are this close
+
+
+def _detect_and_fix_swaps(kp_new: np.ndarray, kp_prev: np.ndarray,
+                           conf_thresh: float = 0.2) -> np.ndarray:
+    """
+    Correct left/right label confusion using two strategies:
+
+    Upper body (shoulders/elbows/wrists) — x-crossover with deadband:
+      Arms don't genuinely cross in fencing, so a flip in x-order means a
+      YOLO label swap. Ignore crossovers smaller than _SWAP_DEADBAND px to
+      avoid false corrections when nearly parallel to camera.
+
+    Lower body (hips/knees/ankles) — distance-based assignment:
+      Legs DO cross during lunges and footwork, so x-order is meaningless.
+      Instead, assign each current detection to whichever previous position
+      it's closest to. This keeps each joint tracking its own limb regardless
+      of which side of the body it's on.
+    """
+    kp = kp_new.copy()
+
+    # --- upper body: x-crossover ---
+    for l, r in _UPPER_PAIRS:
+        if (kp[l, 2] < conf_thresh or kp[r, 2] < conf_thresh or
+                kp_prev[l, 2] < conf_thresh or kp_prev[r, 2] < conf_thresh):
+            continue
+        if abs(kp[l, 0] - kp[r, 0]) < _SWAP_DEADBAND:
+            continue
+        prev_l_was_left = kp_prev[l, 0] < kp_prev[r, 0]
+        curr_l_is_left  = kp[l, 0]      < kp[r, 0]
+        if prev_l_was_left != curr_l_is_left:
+            kp[[l, r]] = kp[[r, l]]
+
+    # --- lower body: distance-based assignment ---
+    for l, r in _LOWER_PAIRS:
+        if (kp[l, 2] < conf_thresh or kp[r, 2] < conf_thresh or
+                kp_prev[l, 2] < conf_thresh or kp_prev[r, 2] < conf_thresh):
+            continue
+        # Cost of keeping current assignment vs swapping
+        cost_keep = (np.linalg.norm(kp[l, :2] - kp_prev[l, :2]) +
+                     np.linalg.norm(kp[r, :2] - kp_prev[r, :2]))
+        cost_swap = (np.linalg.norm(kp[r, :2] - kp_prev[l, :2]) +
+                     np.linalg.norm(kp[l, :2] - kp_prev[r, :2]))
+        if cost_swap < cost_keep:
+            kp[[l, r]] = kp[[r, l]]
+
+    return kp
+
 
 class PoseSmoother:
     """
-    Per-track EMA smoother for keypoint (x, y) coordinates.
-    Confidence values are kept raw so visibility thresholds are unaffected.
+    Per-track temporal smoother with swap correction and per-joint velocity limits.
+
+    Pipeline per frame:
+      1. Swap correction        — undo left/right label flips before anything else.
+      2. Velocity clamp         — per-joint cap (raised for wrists/ankles to match
+                                  real lunge speeds at 1080p).
+      3. Velocity-adaptive EMA  — alpha scales up during fast motion so lunges are
+                                  tracked responsively; slow guard posture stays smooth.
+      4. Confidence gate        — below threshold, extrapolate from last known velocity
+                                  (decaying each frame) instead of hard-freezing, so
+                                  occluded weapon-arm detections don't snap on return.
     """
 
-    def __init__(self, alpha: float = 0.4):
-        self.alpha = alpha
-        self._state: dict = {}  # track_id -> smoothed (N, 3) np.ndarray
+    # Max pixels a joint may move per frame — raised to match 1080p lunge speeds
+    _MAX_VEL: dict = {
+        # core — stable anchor
+        5: 20,  6: 20,  11: 20, 12: 20,
+        # mid-limb
+        7: 45,  8: 45,  13: 45, 14: 45,
+        # extremities — fast fencing action
+        0: 80,  1: 80,  2: 80,  3: 80,  4: 80,
+        9: 160, 10: 160,        # wrists: 80 → 160
+        15: 130, 16: 130,       # ankles: 70 → 130
+    }
+    _DEFAULT_MAX_VEL = 45.0
+
+    # Velocity-adaptive alpha range
+    _ALPHA_SLOW  = 0.15   # nearly stationary
+    _ALPHA_FAST  = 0.55   # full-speed lunge
+    _VEL_SLOW    = 5.0    # px/frame below which we use ALPHA_SLOW
+    _VEL_FAST    = 60.0   # px/frame above which we use ALPHA_FAST
+
+    # Velocity-decay prediction when confidence is low
+    _VEL_DECAY   = 0.7    # multiply carried velocity by this each frame
+
+    def __init__(self, conf_gate: float = 0.2):
+        self.conf_gate  = conf_gate
+        self._state: dict  = {}   # track_id -> smoothed (N, 3) np.ndarray
+        self._veloc: dict  = {}   # track_id -> last velocity (N, 2) np.ndarray
 
     def smooth(self, track_id: int, kp: np.ndarray) -> np.ndarray:
         if track_id not in self._state:
             self._state[track_id] = kp.copy()
+            self._veloc[track_id] = np.zeros((len(kp), 2), dtype=np.float32)
             return kp
-        prev = self._state[track_id]
-        out = prev.copy()
-        out[:, :2] = self.alpha * kp[:, :2] + (1 - self.alpha) * prev[:, :2]
-        out[:, 2]  = kp[:, 2]          # keep raw confidence
+
+        prev     = self._state[track_id]
+        prev_vel = self._veloc[track_id]
+
+        # 1. Fix left/right label swaps
+        kp = _detect_and_fix_swaps(kp, prev, self.conf_gate)
+
+        out     = prev.copy()
+        new_vel = np.zeros_like(prev_vel)
+
+        for idx in range(len(kp)):
+            max_vel = self._MAX_VEL.get(idx, self._DEFAULT_MAX_VEL)
+
+            if kp[idx, 2] > self.conf_gate:
+                # 2. Velocity clamp on the new detection
+                raw_delta = kp[idx, :2] - prev[idx, :2]
+                dist      = np.linalg.norm(raw_delta)
+                if dist > max_vel:
+                    raw_delta = raw_delta * (max_vel / (dist + 1e-6))
+                clamped = prev[idx, :2] + raw_delta
+
+                # 3. Velocity-adaptive alpha
+                alpha = np.interp(dist,
+                                  [self._VEL_SLOW, self._VEL_FAST],
+                                  [self._ALPHA_SLOW, self._ALPHA_FAST])
+                out[idx, :2] = alpha * clamped + (1 - alpha) * prev[idx, :2]
+                new_vel[idx] = out[idx, :2] - prev[idx, :2]
+            else:
+                # 4. Velocity-decay prediction — extrapolate rather than freeze
+                predicted    = prev[idx, :2] + prev_vel[idx]
+                out[idx, :2] = predicted
+                new_vel[idx] = prev_vel[idx] * self._VEL_DECAY
+
+            out[idx, 2] = kp[idx, 2]
+
         self._state[track_id] = out
+        self._veloc[track_id] = new_vel
         return out
 
     def prune(self, active_ids: set):
@@ -112,6 +241,7 @@ class PoseSmoother:
         for tid in list(self._state):
             if tid not in active_ids:
                 del self._state[tid]
+                self._veloc.pop(tid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +258,18 @@ def _angle(p1, p2, p3) -> float:
     return math.degrees(math.acos(np.clip(np.dot(v1, v2) / denom, -1.0, 1.0)))
 
 
+_ANGLE_CONF_GATE = 0.2   # keypoints below this confidence yield 180.0 (neutral)
+
+
+def _safe_angle(kp: np.ndarray, i1: int, i2: int, i3: int) -> float:
+    """Return _angle(i1, i2, i3) or 180.0 if any keypoint is low-confidence."""
+    if kp[i1, 2] < _ANGLE_CONF_GATE or kp[i2, 2] < _ANGLE_CONF_GATE or kp[i3, 2] < _ANGLE_CONF_GATE:
+        return 180.0
+    return _angle((kp[i1, 0], kp[i1, 1]),
+                  (kp[i2, 0], kp[i2, 1]),
+                  (kp[i3, 0], kp[i3, 1]))
+
+
 def _extract_angles_coco(kp: np.ndarray) -> dict:
     """
     Derive joint angles from COCO-17 keypoints.
@@ -138,19 +280,22 @@ def _extract_angles_coco(kp: np.ndarray) -> dict:
                    13=L-knee     14=R-knee
                    15=L-ankle    16=R-ankle
     """
-    def xy(i):
-        return (kp[i][0], kp[i][1])
-
-    left_arm  = _angle(xy(5),  xy(7),  xy(9))
-    right_arm = _angle(xy(6),  xy(8),  xy(10))
-    left_leg  = _angle(xy(11), xy(13), xy(15))
-    right_leg = _angle(xy(12), xy(14), xy(16))
+    left_arm  = _safe_angle(kp, 5,  7,  9)
+    right_arm = _safe_angle(kp, 6,  8,  10)
+    left_leg  = _safe_angle(kp, 11, 13, 15)
+    right_leg = _safe_angle(kp, 12, 14, 16)
 
     hip_cx = (kp[11][0] + kp[12][0]) / 2
     hip_cy = (kp[11][1] + kp[12][1]) / 2
 
     front = 'left' if kp[15][0] < kp[16][0] else 'right'
     front_knee = left_leg if front == 'left' else right_leg
+
+    # Weapon arm: whichever wrist is further laterally from hip centre
+    # (works for both left- and right-handed fencers)
+    l_wrist_dist = abs(kp[9,  0] - hip_cx) if kp[9,  2] > _ANGLE_CONF_GATE else 0.0
+    r_wrist_dist = abs(kp[10, 0] - hip_cx) if kp[10, 2] > _ANGLE_CONF_GATE else 0.0
+    weapon_arm = left_arm if l_wrist_dist > r_wrist_dist else right_arm
 
     return {
         'left_arm_angle':   left_arm,
@@ -160,7 +305,7 @@ def _extract_angles_coco(kp: np.ndarray) -> dict:
         'hip_center_x':     hip_cx,
         'hip_center_y':     hip_cy,
         'front_knee_angle': front_knee,
-        'weapon_arm_angle': right_arm,
+        'weapon_arm_angle': weapon_arm,
     }
 
 
@@ -204,18 +349,13 @@ def _extract_angles_mp(landmarks, w: int, h: int) -> dict:
 # Drawing helpers
 # ---------------------------------------------------------------------------
 
-HEAD_KP_INDICES = [0, 1, 2, 3, 4]  # nose, left_eye, right_eye, left_ear, right_ear
-
 def _draw_skeleton_coco(frame, kp: np.ndarray,
                         dot_colour=(0, 0, 255),
                         line_colour=(0, 255, 0)):
-    # Draw a single centroid point for all visible head keypoints
-    head_pts = [(kp[i][0], kp[i][1]) for i in HEAD_KP_INDICES if kp[i][2] > 0.05]
+    # Head: nose-only at higher confidence threshold (fencing masks confuse multi-point centroid)
     head_centre = None
-    if head_pts:
-        cx = int(sum(p[0] for p in head_pts) / len(head_pts))
-        cy = int(sum(p[1] for p in head_pts) / len(head_pts))
-        head_centre = (cx, cy)
+    if kp[0, 2] > 0.25:
+        head_centre = (int(kp[0, 0]), int(kp[0, 1]))
         cv2.circle(frame, head_centre, 5, dot_colour, -1)
 
     # Connect head centroid to each visible shoulder (indices 5, 6)
@@ -362,37 +502,64 @@ class YoloPoseEngine:
 
         print(f"[YoloPoseEngine] {video_path.name}  {width}x{height} @ {fps:.1f}fps  ({total} frames)")
 
-        frame_data = []
-        frame_id   = 0
+        frame_data  = []
+        frame_id    = 0
+        t_detect    = 0.0
+        t_annotate  = 0.0
+        t_write     = 0.0
+        t_total_start = time.perf_counter()
 
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
+            t0 = time.perf_counter()
             poses = self.process_frame(frame)
+            t1 = time.perf_counter()
             self.annotate_frame(frame, poses)
+            t2 = time.perf_counter()
             writer.write(frame)
+            t3 = time.perf_counter()
+
+            t_detect   += t1 - t0
+            t_annotate += t2 - t1
+            t_write    += t3 - t2
 
             # Store analysis data (first detected person)
             p = poses[0] if poses else None
             frame_data.append({
-                'frame':           frame_id,
+                'frame':            frame_id,
                 'persons_detected': len(poses),
-                'left_arm_angle':  p.left_arm_angle  if p else None,
-                'right_arm_angle': p.right_arm_angle if p else None,
-                'left_leg_angle':  p.left_leg_angle  if p else None,
-                'right_leg_angle': p.right_leg_angle if p else None,
-                'hip_center_x':    p.hip_center_x    if p else None,
+                'left_arm_angle':   p.left_arm_angle  if p else None,
+                'right_arm_angle':  p.right_arm_angle if p else None,
+                'left_leg_angle':   p.left_leg_angle  if p else None,
+                'right_leg_angle':  p.right_leg_angle if p else None,
+                'hip_center_x':     p.hip_center_x    if p else None,
+                'detect_ms':        round((t1 - t0) * 1000, 1),
             })
 
             frame_id += 1
             if frame_id % 60 == 0:
-                print(f"  {frame_id}/{total} frames …")
+                elapsed = time.perf_counter() - t_total_start
+                avg_fps = frame_id / elapsed
+                print(f"  {frame_id}/{total} frames  |  {avg_fps:.1f} fps  |  "
+                      f"detect {t_detect/frame_id*1000:.1f}ms  "
+                      f"annotate {t_annotate/frame_id*1000:.1f}ms  "
+                      f"write {t_write/frame_id*1000:.1f}ms  (avg/frame)")
+
+        wall = time.perf_counter() - t_total_start
+        avg_fps = frame_id / wall if wall > 0 else 0
 
         cap.release()
         writer.release()
-        print(f"[YoloPoseEngine] done — {frame_id} frames → {output_path}")
+
+        print(f"\n[YoloPoseEngine] done — {frame_id} frames → {output_path}")
+        print(f"  Wall time   : {wall:.2f}s")
+        print(f"  Avg FPS     : {avg_fps:.1f}")
+        print(f"  Detection   : {t_detect:.2f}s  ({t_detect/wall*100:.1f}%)")
+        print(f"  Annotation  : {t_annotate:.2f}s  ({t_annotate/wall*100:.1f}%)")
+        print(f"  Video write : {t_write:.2f}s  ({t_write/wall*100:.1f}%)")
         return frame_data
 
     def close(self):
@@ -412,7 +579,7 @@ class YoloPoseEngine:
 
     def _process_yolo_pose(self, frame: np.ndarray) -> List[PersonPose]:
         """One-pass: YOLO pose model → boxes + COCO-17 keypoints. Uses persistent tracking."""
-        results = self._yolo.track(frame, persist=True, conf=0.25, verbose=False)
+        results = self._yolo.track(frame, persist=True, conf=0.25, verbose=False,device='mps')
         poses   = []
 
         active_ids = set()
@@ -512,14 +679,14 @@ def _draw_skeleton_mp_from_kp(frame, kp: np.ndarray):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    video = Config.PROJECT_ROOT / "sample" / "fencing2.mp4"
+    video = Config.PROJECT_ROOT / "sample" / "fencing.mp4"
 
     # --- Mode 1: YOLO pose model (one-pass, fastest) ---
     print("\n=== Mode: yolo_pose ===")
     with YoloPoseEngine(mode='yolo_pose', model_size='n') as engine:
         engine.process_video(video)
 
-    # --- Mode 2: YOLO detection + MediaPipe pose (reference architecture) ---
-    print("\n=== Mode: yolo_mediapipe ===")
-    with YoloPoseEngine(mode='yolo_mediapipe', mp_model='full') as engine:
-        engine.process_video(video)
+    # # --- Mode 2: YOLO detection + MediaPipe pose (reference architecture) ---
+    # print("\n=== Mode: yolo_mediapipe ===")
+    # with YoloPoseEngine(mode='yolo_mediapipe', mp_model='full') as engine:
+    #     engine.process_video(video)
