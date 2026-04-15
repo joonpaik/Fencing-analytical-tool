@@ -87,32 +87,37 @@ class PersonPose:
 # Swap detection + temporal smoother
 # ---------------------------------------------------------------------------
 
-# All symmetric pairs — distance-based assignment applied to every pair.
-# Fencers stand side-on to the camera, so x-ordering is unreliable for both
-# arms (stacked front/back at nearly the same x) and legs (cross during lunges).
-# Distance-based is the only robust strategy: assign each new detection to
-# whichever previous position it is closest to.
-_ALL_PAIRS = [
+# Independent symmetric pairs — checked and swapped individually.
+_INDEPENDENT_PAIRS = [
     (5,  6),   # shoulders
     (7,  8),   # elbows
     (9,  10),  # wrists
     (11, 12),  # hips
-    (13, 14),  # knees
-    (15, 16),  # ankles
+]
+
+# Linked leg chains — knees and ankles must be swapped together to avoid
+# producing a crossed skeleton when only one pair would flip independently.
+# Each entry is (left_knee, right_knee, left_ankle, right_ankle).
+_LEG_CHAINS = [
+    (13, 14, 15, 16),
 ]
 
 
 def _detect_and_fix_swaps(kp_new: np.ndarray, kp_prev: np.ndarray,
                            conf_thresh: float = 0.2) -> np.ndarray:
     """
-    For every symmetric pair, choose the assignment (keep or swap) that
-    minimises total Euclidean distance from the previous smoothed positions.
+    Choose left/right assignments that minimise total Euclidean distance from
+    the previous smoothed positions.
 
-    This handles both arms (side-on stacking) and legs (genuine crossing)
-    with the same logic, without any x-ordering assumptions.
+    Independent pairs (shoulders, elbows, wrists, hips) are checked separately.
+    Leg joints (knees + ankles) are treated as a linked chain: both pairs swap
+    together or neither does, preventing the knee-swaps-but-ankle-doesn't
+    crossing artifact seen during deep lunges.
     """
     kp = kp_new.copy()
-    for l, r in _ALL_PAIRS:
+
+    # --- independent pairs ---
+    for l, r in _INDEPENDENT_PAIRS:
         if (kp[l, 2] < conf_thresh or kp[r, 2] < conf_thresh or
                 kp_prev[l, 2] < conf_thresh or kp_prev[r, 2] < conf_thresh):
             continue
@@ -122,6 +127,23 @@ def _detect_and_fix_swaps(kp_new: np.ndarray, kp_prev: np.ndarray,
                      np.linalg.norm(kp[l, :2] - kp_prev[r, :2]))
         if cost_swap < cost_keep:
             kp[[l, r]] = kp[[r, l]]
+
+    # --- linked leg chains ---
+    for lk, rk, la, ra in _LEG_CHAINS:
+        indices = [lk, rk, la, ra]
+        if any(kp[i, 2] < conf_thresh or kp_prev[i, 2] < conf_thresh
+               for i in indices):
+            continue
+        cost_keep = sum(np.linalg.norm(kp[i, :2] - kp_prev[i, :2])
+                        for i in indices)
+        cost_swap = (np.linalg.norm(kp[rk, :2] - kp_prev[lk, :2]) +
+                     np.linalg.norm(kp[lk, :2] - kp_prev[rk, :2]) +
+                     np.linalg.norm(kp[ra, :2] - kp_prev[la, :2]) +
+                     np.linalg.norm(kp[la, :2] - kp_prev[ra, :2]))
+        if cost_swap < cost_keep:
+            kp[[lk, rk]] = kp[[rk, lk]]
+            kp[[la, ra]] = kp[[ra, la]]
+
     return kp
 
 
@@ -145,7 +167,7 @@ class PoseSmoother:
         # core — stable anchor
         5: 20,  6: 20,  11: 20, 12: 20,
         # mid-limb
-        7: 45,  8: 45,  13: 45, 14: 45,
+        7: 45,  8: 45,  13: 100, 14: 100,
         # extremities — fast fencing action
         0: 80,  1: 80,  2: 80,  3: 80,  4: 80,
         9: 160, 10: 160,        # wrists: 80 → 160
@@ -450,6 +472,7 @@ class YoloPoseEngine:
         self,
         video_path: Path,
         output_path: Optional[Path] = None,
+        skeleton_only: bool = False,
     ) -> List[dict]:
         """
         Full pipeline: read → detect → annotate → write.
@@ -465,8 +488,14 @@ class YoloPoseEngine:
         total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         if output_path is None:
-            Config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            output_path = Config.OUTPUT_DIR / f"{video_path.stem}_{self.mode}.mp4"
+            if skeleton_only:
+                output_path = Config.OUTPUT_DIR / f"{video_path.stem}_{self.mode}_skeleton.mp4"
+                Config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            else:
+                output_path = Config.OUTPUT_DIR / f"{video_path.stem}_{self.mode}.mp4"
+                Config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
 
         writer = cv2.VideoWriter(
             str(output_path),
@@ -492,9 +521,10 @@ class YoloPoseEngine:
             t0 = time.perf_counter()
             poses = self.process_frame(frame)
             t1 = time.perf_counter()
-            self.annotate_frame(frame, poses)
+            canvas = np.zeros_like(frame) if skeleton_only else frame
+            self.annotate_frame(canvas, poses)
             t2 = time.perf_counter()
-            writer.write(frame)
+            writer.write(canvas)
             t3 = time.perf_counter()
 
             t_detect   += t1 - t0
@@ -658,8 +688,8 @@ if __name__ == "__main__":
 
     # --- Mode 1: YOLO pose model (one-pass, fastest) ---
     print("\n=== Mode: yolo_pose ===")
-    with YoloPoseEngine(mode='yolo_pose', model_size='n') as engine:
-        engine.process_video(video)
+    with YoloPoseEngine(mode='yolo_pose', model_size='s') as engine:
+        engine.process_video(video, skeleton_only=True)
 
     # # --- Mode 2: YOLO detection + MediaPipe pose (reference architecture) ---
     # print("\n=== Mode: yolo_mediapipe ===")
