@@ -66,6 +66,7 @@ MP_POSE_CONNECTIONS = [
 @dataclass
 class PersonPose:
     """Holds detection box and keypoints for one person in a frame."""
+    track_id: int
     box: Tuple[int, int, int, int]       # (x1, y1, x2, y2) in full-frame coords
     keypoints: List[Tuple[float, float, float]]  # (x, y, conf/visibility) per point
     left_arm_angle: float = 0.0
@@ -445,6 +446,14 @@ class YoloPoseEngine:
             self._smoother = PoseSmoother()
             print(f"[YoloPoseEngine] mode=yolo_mediapipe  det=yolo26n-pose.pt  pose={task_name}")
 
+        # Canonical two-fencer state. IDs are fixed as 1 and 2.
+        # We do not expose raw YOLO IDs because they can flip on occlusion.
+        self._fencer_state = {
+            1: {'raw_id': None, 'center': None, 'misses': 0},
+            2: {'raw_id': None, 'center': None, 'misses': 0},
+        }
+        self._max_state_misses = 45
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -461,6 +470,18 @@ class YoloPoseEngine:
     def annotate_frame(self, frame: np.ndarray, poses: List[PersonPose]) -> np.ndarray:
         """Draw bounding boxes, skeletons, and angle labels on `frame` in-place."""
         for pose in poses:
+            x1, y1, x2, y2 = pose.box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (180, 180, 180), 1)
+            cv2.putText(
+                frame,
+                f"Fencer {pose.track_id}",
+                (x1, max(20, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
             kp = pose.kp
             if self.mode == 'yolo_pose':
                 _draw_skeleton_coco(frame, kp)
@@ -582,34 +603,147 @@ class YoloPoseEngine:
     # Private helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _box_center(box: Tuple[int, int, int, int]) -> Tuple[float, float]:
+        x1, y1, x2, y2 = box
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+    @staticmethod
+    def _box_area(box: Tuple[int, int, int, int]) -> int:
+        x1, y1, x2, y2 = box
+        return max(0, x2 - x1) * max(0, y2 - y1)
+
+    def _select_two_fencers(self, detections: List[dict]) -> List[dict]:
+        """Pick at most two best person candidates (largest boxes)."""
+        if len(detections) <= 2:
+            return detections
+        return sorted(detections, key=lambda d: self._box_area(d['box']), reverse=True)[:2]
+
+    def _assign_canonical_ids(self, detections: List[dict]) -> List[dict]:
+        """
+        Assign stable canonical IDs {1, 2} to detections.
+
+        Matching order:
+          1) Raw YOLO ID continuity (if a known raw id reappears)
+          2) Center proximity to each canonical slot's previous center
+          3) Left-to-right fallback for any cold-start ambiguity
+        """
+        if not detections:
+            for slot in (1, 2):
+                st = self._fencer_state[slot]
+                st['misses'] += 1
+                st['raw_id'] = None
+                if st['misses'] > self._max_state_misses:
+                    st['center'] = None
+            return []
+
+        used_slots = set()
+        unassigned = []
+
+        # Pass 1: direct raw-id continuity.
+        raw_to_slot = {
+            st['raw_id']: slot
+            for slot, st in self._fencer_state.items()
+            if st['raw_id'] is not None
+        }
+        for d in detections:
+            slot = raw_to_slot.get(d['raw_id'])
+            if slot is not None and slot not in used_slots:
+                d['track_id'] = slot
+                used_slots.add(slot)
+            else:
+                unassigned.append(d)
+
+        # Pass 2: center-distance assignment for remaining detections.
+        open_slots = [s for s in (1, 2) if s not in used_slots]
+        while unassigned and open_slots:
+            best = None
+            for d in unassigned:
+                dc = self._box_center(d['box'])
+                for slot in open_slots:
+                    prev_c = self._fencer_state[slot]['center']
+                    if prev_c is None:
+                        continue
+                    dist = math.hypot(dc[0] - prev_c[0], dc[1] - prev_c[1])
+                    if best is None or dist < best[0]:
+                        best = (dist, d, slot)
+            if best is None:
+                break
+            _, d_best, slot_best = best
+            d_best['track_id'] = slot_best
+            used_slots.add(slot_best)
+            open_slots.remove(slot_best)
+            unassigned.remove(d_best)
+
+        # Pass 3: deterministic left-to-right fallback.
+        if unassigned:
+            open_slots = [s for s in (1, 2) if s not in used_slots]
+            unassigned_sorted = sorted(unassigned, key=lambda d: self._box_center(d['box'])[0])
+            open_slots_sorted = sorted(open_slots)
+            for d, slot in zip(unassigned_sorted, open_slots_sorted):
+                d['track_id'] = slot
+                used_slots.add(slot)
+
+        # Update canonical slot states.
+        slots_touched = set()
+        for d in detections:
+            slot = d.get('track_id')
+            if slot is None:
+                continue
+            slots_touched.add(slot)
+            st = self._fencer_state[slot]
+            st['raw_id'] = d['raw_id']
+            st['center'] = self._box_center(d['box'])
+            st['misses'] = 0
+
+        for slot in (1, 2):
+            if slot not in slots_touched:
+                st = self._fencer_state[slot]
+                st['misses'] += 1
+                st['raw_id'] = None
+                if st['misses'] > self._max_state_misses:
+                    st['center'] = None
+
+        return [d for d in detections if d.get('track_id') in (1, 2)]
+
     def _process_yolo_pose(self, frame: np.ndarray) -> List[PersonPose]:
         """One-pass: YOLO pose model → boxes + COCO-17 keypoints. Uses persistent tracking."""
         results = self._yolo.track(frame, persist=True, conf=0.25, verbose=False,device='mps')
-        poses   = []
-
-        active_ids = set()
+        poses = []
+        raw_dets = []
 
         for r in results:
             if r.keypoints is None:
                 continue
             for i, box in enumerate(r.boxes.xyxy):
                 x1, y1, x2, y2 = map(int, box)
-                track_id = int(r.boxes.id[i]) if r.boxes.id is not None else i
-                active_ids.add(track_id)
+                raw_id = int(r.boxes.id[i]) if r.boxes.id is not None else i
+                raw_dets.append({
+                    'box': (x1, y1, x2, y2),
+                    'raw_id': raw_id,
+                    'kp': r.keypoints.data[i].cpu().numpy(),
+                })
 
-                kp_data = r.keypoints.data[i].cpu().numpy()   # (17, 3): x, y, conf
-                kp_data = self._smoother.smooth(track_id, kp_data)
+        selected = self._select_two_fencers(raw_dets)
+        assigned = self._assign_canonical_ids(selected)
+        active_ids = set()
 
-                angles = _extract_angles_coco(kp_data)
-                pose   = PersonPose(
-                    box=(x1, y1, x2, y2),
-                    keypoints=kp_data.tolist(),
-                    **angles,
-                )
-                poses.append(pose)
+        for d in assigned:
+            track_id = d['track_id']
+            active_ids.add(track_id)
+
+            kp_data = self._smoother.smooth(track_id, d['kp'])
+            angles = _extract_angles_coco(kp_data)
+            pose = PersonPose(
+                track_id=track_id,
+                box=d['box'],
+                keypoints=kp_data.tolist(),
+                **angles,
+            )
+            poses.append(pose)
 
         self._smoother.prune(active_ids)
-        return poses
+        return sorted(poses, key=lambda p: p.track_id)
 
     def _process_yolo_mediapipe(self, frame: np.ndarray) -> List[PersonPose]:
         """
@@ -618,48 +752,58 @@ class YoloPoseEngine:
           2. MediaPipe PoseLandmarker runs on each cropped region.
         """
         results = self._yolo.track(frame, persist=True, conf=0.25, verbose=False)
-        poses      = []
-        active_ids = set()
+        poses = []
+        raw_dets = []
 
         for r in results:
             for i, box in enumerate(r.boxes.xyxy):
                 x1, y1, x2, y2 = map(int, box)
-                track_id = int(r.boxes.id[i]) if r.boxes.id is not None else i
-                active_ids.add(track_id)
-                crop = frame[y1:y2, x1:x2]
-                if crop.size == 0:
-                    continue
+                raw_id = int(r.boxes.id[i]) if r.boxes.id is not None else i
+                raw_dets.append({'box': (x1, y1, x2, y2), 'raw_id': raw_id})
 
-                ch, cw = crop.shape[:2]
-                crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
-                det      = self._pose_detector.detect(mp_image)
+        selected = self._select_two_fencers(raw_dets)
+        assigned = self._assign_canonical_ids(selected)
+        active_ids = set()
 
-                if not det.pose_landmarks:
-                    continue
+        for d in assigned:
+            x1, y1, x2, y2 = d['box']
+            track_id = d['track_id']
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
 
-                landmarks = det.pose_landmarks[0]   # first person in crop
+            ch, cw = crop.shape[:2]
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
+            det = self._pose_detector.detect(mp_image)
 
-                # Convert crop-relative landmarks to full-frame pixel coords
-                kp_arr = np.array(
-                    [(lm.x * cw + x1, lm.y * ch + y1, lm.visibility) for lm in landmarks],
-                    dtype=np.float32,
-                )
-                kp_arr = self._smoother.smooth(track_id, kp_arr)
+            if not det.pose_landmarks:
+                continue
 
-                angles = _extract_angles_mp(landmarks, cw, ch)
-                # Translate hip_center_x to full-frame coords
-                angles['hip_center_x'] += x1
+            active_ids.add(track_id)
+            landmarks = det.pose_landmarks[0]   # first person in crop
 
-                pose = PersonPose(
-                    box=(x1, y1, x2, y2),
-                    keypoints=kp_arr.tolist(),
-                    **angles,
-                )
-                poses.append(pose)
+            # Convert crop-relative landmarks to full-frame pixel coords
+            kp_arr = np.array(
+                [(lm.x * cw + x1, lm.y * ch + y1, lm.visibility) for lm in landmarks],
+                dtype=np.float32,
+            )
+            kp_arr = self._smoother.smooth(track_id, kp_arr)
+
+            angles = _extract_angles_mp(landmarks, cw, ch)
+            # Translate hip_center_x to full-frame coords
+            angles['hip_center_x'] += x1
+
+            pose = PersonPose(
+                track_id=track_id,
+                box=(x1, y1, x2, y2),
+                keypoints=kp_arr.tolist(),
+                **angles,
+            )
+            poses.append(pose)
 
         self._smoother.prune(active_ids)
-        return poses
+        return sorted(poses, key=lambda p: p.track_id)
 
 
 # ---------------------------------------------------------------------------
@@ -684,12 +828,12 @@ def _draw_skeleton_mp_from_kp(frame, kp: np.ndarray):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    video = Config.PROJECT_ROOT / "sample" / "fencing.mp4"
+    video = Config.PROJECT_ROOT / "sample" / "fencing2.mp4"
 
     # --- Mode 1: YOLO pose model (one-pass, fastest) ---
     print("\n=== Mode: yolo_pose ===")
     with YoloPoseEngine(mode='yolo_pose', model_size='s') as engine:
-        engine.process_video(video, skeleton_only=True)
+        engine.process_video(video, skeleton_only=False)
 
     # # --- Mode 2: YOLO detection + MediaPipe pose (reference architecture) ---
     # print("\n=== Mode: yolo_mediapipe ===")
