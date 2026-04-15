@@ -91,61 +91,99 @@ class PersonPose:
 # Independent symmetric pairs — checked and swapped individually.
 _INDEPENDENT_PAIRS = [
     (5,  6),   # shoulders
-    (7,  8),   # elbows
-    (9,  10),  # wrists
     (11, 12),  # hips
 ]
 
-# Linked leg chains — knees and ankles must be swapped together to avoid
-# producing a crossed skeleton when only one pair would flip independently.
-# Each entry is (left_knee, right_knee, left_ankle, right_ankle).
-_LEG_CHAINS = [
-    (13, 14, 15, 16),
+# Linked limb chains — proximal and distal joints of each arm/leg must swap
+# together to prevent half-swap artifacts (e.g. elbow flips but wrist doesn't,
+# producing an arm that crosses the body).
+# Each entry: (left_proximal, right_proximal, left_distal, right_distal).
+_LIMB_CHAINS = [
+    (7,  8,  9,  10),  # elbows (proximal) + wrists (distal)
+    (13, 14, 15, 16),  # knees  (proximal) + ankles (distal)
 ]
 
 
+def _fix_pair(kp: np.ndarray, kp_prev: np.ndarray,
+              l: int, r: int, conf_thresh: float) -> bool:
+    """
+    Check one symmetric pair and swap in-place if that reduces distance cost.
+    Returns True if both joints are visible (swap check was performed).
+    """
+    if (kp[l, 2] < conf_thresh or kp[r, 2] < conf_thresh or
+            kp_prev[l, 2] < conf_thresh or kp_prev[r, 2] < conf_thresh):
+        return False
+    cost_keep = (np.linalg.norm(kp[l, :2] - kp_prev[l, :2]) +
+                 np.linalg.norm(kp[r, :2] - kp_prev[r, :2]))
+    cost_swap = (np.linalg.norm(kp[r, :2] - kp_prev[l, :2]) +
+                 np.linalg.norm(kp[l, :2] - kp_prev[r, :2]))
+    if cost_swap < cost_keep:
+        kp[[l, r]] = kp[[r, l]]
+    return True
+
+
 def _detect_and_fix_swaps(kp_new: np.ndarray, kp_prev: np.ndarray,
-                           conf_thresh: float = 0.2) -> np.ndarray:
+                           conf_thresh: float = 0.15) -> np.ndarray:
     """
     Choose left/right assignments that minimise total Euclidean distance from
     the previous smoothed positions.
 
-    Independent pairs (shoulders, elbows, wrists, hips) are checked separately.
-    Leg joints (knees + ankles) are treated as a linked chain: both pairs swap
-    together or neither does, preventing the knee-swaps-but-ankle-doesn't
-    crossing artifact seen during deep lunges.
+    Shoulders and hips are checked independently.  Arms (elbow+wrist) and legs
+    (knee+ankle) are treated as linked chains so both segments always swap
+    together — preventing half-swap artifacts where one end flips but the other
+    doesn't.
+
+    Partial-visibility fallback: if not all four joints of a chain are above
+    conf_thresh, the proximal pair drives the swap decision and the result is
+    applied to any visible distal joints.  This ensures that a low-confidence
+    back-ankle or weapon-wrist never blocks the swap check for the whole limb.
     """
     kp = kp_new.copy()
 
     # --- independent pairs ---
     for l, r in _INDEPENDENT_PAIRS:
-        if (kp[l, 2] < conf_thresh or kp[r, 2] < conf_thresh or
-                kp_prev[l, 2] < conf_thresh or kp_prev[r, 2] < conf_thresh):
-            continue
-        cost_keep = (np.linalg.norm(kp[l, :2] - kp_prev[l, :2]) +
-                     np.linalg.norm(kp[r, :2] - kp_prev[r, :2]))
-        cost_swap = (np.linalg.norm(kp[r, :2] - kp_prev[l, :2]) +
-                     np.linalg.norm(kp[l, :2] - kp_prev[r, :2]))
-        if cost_swap < cost_keep:
-            kp[[l, r]] = kp[[r, l]]
+        _fix_pair(kp, kp_prev, l, r, conf_thresh)
 
-    # --- linked leg chains ---
-    for lk, rk, la, ra in _LEG_CHAINS:
-        indices = [lk, rk, la, ra]
-        if any(kp[i, 2] < conf_thresh or kp_prev[i, 2] < conf_thresh
-               for i in indices):
-            continue
-        cost_keep = sum(np.linalg.norm(kp[i, :2] - kp_prev[i, :2])
-                        for i in indices)
-        cost_swap = (np.linalg.norm(kp[rk, :2] - kp_prev[lk, :2]) +
-                     np.linalg.norm(kp[lk, :2] - kp_prev[rk, :2]) +
-                     np.linalg.norm(kp[ra, :2] - kp_prev[la, :2]) +
-                     np.linalg.norm(kp[la, :2] - kp_prev[ra, :2]))
-        if cost_swap < cost_keep:
-            kp[[lk, rk]] = kp[[rk, lk]]
-            kp[[la, ra]] = kp[[ra, la]]
+    # --- linked limb chains with proximal-fallback ---
+    for lp, rp, ld, rd in _LIMB_CHAINS:
+        prox_vis = _pair_visible(kp, kp_prev, lp, rp, conf_thresh)
+        dist_vis = _pair_visible(kp, kp_prev, ld, rd, conf_thresh)
+
+        if prox_vis and dist_vis:
+            # Full 4-joint chain comparison
+            cost_keep = sum(np.linalg.norm(kp[i, :2] - kp_prev[i, :2])
+                            for i in (lp, rp, ld, rd))
+            cost_swap = (np.linalg.norm(kp[rp, :2] - kp_prev[lp, :2]) +
+                         np.linalg.norm(kp[lp, :2] - kp_prev[rp, :2]) +
+                         np.linalg.norm(kp[rd, :2] - kp_prev[ld, :2]) +
+                         np.linalg.norm(kp[ld, :2] - kp_prev[rd, :2]))
+            if cost_swap < cost_keep:
+                kp[[lp, rp]] = kp[[rp, lp]]
+                kp[[ld, rd]] = kp[[rd, ld]]
+
+        elif prox_vis:
+            # Proximal pair drives decision; apply to distal if visible
+            cost_keep_p = (np.linalg.norm(kp[lp, :2] - kp_prev[lp, :2]) +
+                           np.linalg.norm(kp[rp, :2] - kp_prev[rp, :2]))
+            cost_swap_p = (np.linalg.norm(kp[rp, :2] - kp_prev[lp, :2]) +
+                           np.linalg.norm(kp[lp, :2] - kp_prev[rp, :2]))
+            if cost_swap_p < cost_keep_p:
+                kp[[lp, rp]] = kp[[rp, lp]]
+                if dist_vis:
+                    kp[[ld, rd]] = kp[[rd, ld]]
+
+        elif dist_vis:
+            # Only distal visible — independent check on distal pair
+            _fix_pair(kp, kp_prev, ld, rd, conf_thresh)
 
     return kp
+
+
+def _pair_visible(kp: np.ndarray, kp_prev: np.ndarray,
+                  l: int, r: int, conf_thresh: float) -> bool:
+    """True when both joints of a pair are above conf_thresh in both frames."""
+    return (kp[l, 2] >= conf_thresh and kp[r, 2] >= conf_thresh and
+            kp_prev[l, 2] >= conf_thresh and kp_prev[r, 2] >= conf_thresh)
 
 
 class PoseSmoother:
@@ -177,10 +215,10 @@ class PoseSmoother:
     _DEFAULT_MAX_VEL = 45.0
 
     # Velocity-adaptive alpha range
-    _ALPHA_SLOW  = 0.15   # nearly stationary
-    _ALPHA_FAST  = 0.55   # full-speed lunge
+    _ALPHA_SLOW  = 0.25   # nearly stationary (was 0.15 → ~4 frame lag vs ~7)
+    _ALPHA_FAST  = 0.70   # full-speed lunge  (was 0.55 → tracks in ~1.4 frames vs ~2)
     _VEL_SLOW    = 5.0    # px/frame below which we use ALPHA_SLOW
-    _VEL_FAST    = 60.0   # px/frame above which we use ALPHA_FAST
+    _VEL_FAST    = 50.0   # px/frame above which we use ALPHA_FAST (was 60 → engages sooner)
 
     # Velocity-decay prediction when confidence is low
     _VEL_DECAY   = 0.7    # multiply carried velocity by this each frame
@@ -833,7 +871,7 @@ if __name__ == "__main__":
     # --- Mode 1: YOLO pose model (one-pass, fastest) ---
     print("\n=== Mode: yolo_pose ===")
     with YoloPoseEngine(mode='yolo_pose', model_size='s') as engine:
-        engine.process_video(video, skeleton_only=False)
+        engine.process_video(video, skeleton_only=True)
 
     # # --- Mode 2: YOLO detection + MediaPipe pose (reference architecture) ---
     # print("\n=== Mode: yolo_mediapipe ===")
