@@ -223,10 +223,18 @@ class PoseSmoother:
     # Velocity-decay prediction when confidence is low
     _VEL_DECAY   = 0.7    # multiply carried velocity by this each frame
 
+    # Temporal crossing correction — legs are allowed to be in a geometrically
+    # crossed state for up to this many consecutive frames (~267ms at 30fps)
+    # before a force-swap is triggered.  Brief real crossings stay; stuck errors
+    # get corrected.
+    _CROSS_CORRECT_FRAMES = 8
+
     def __init__(self, conf_gate: float = 0.2):
         self.conf_gate  = conf_gate
         self._state: dict  = {}   # track_id -> smoothed (N, 3) np.ndarray
         self._veloc: dict  = {}   # track_id -> last velocity (N, 2) np.ndarray
+        self._leg_cross_count: dict = {}  # track_id -> consecutive crossed-leg frames
+        self._arm_cross_count: dict = {}  # track_id -> consecutive crossed-arm frames
 
     def smooth(self, track_id: int, kp: np.ndarray) -> np.ndarray:
         if track_id not in self._state:
@@ -268,6 +276,34 @@ class PoseSmoother:
 
             out[idx, 2] = kp[idx, 2]
 
+        # 5. Temporal crossing correction
+        #    For each limb pair, count consecutive frames where the smoothed
+        #    chains are geometrically crossed (anchor→tip lines intersect).
+        #    Brief real crossings stay; after _CROSS_CORRECT_FRAMES consecutive
+        #    crossed frames the labels are force-swapped and the counter resets.
+
+        leg_count = self._leg_cross_count.get(track_id, 0)
+        if _legs_are_crossed(out, conf_thresh=0.15):
+            leg_count += 1
+            if leg_count >= self._CROSS_CORRECT_FRAMES:
+                out[[13, 14]] = out[[14, 13]]
+                out[[15, 16]] = out[[16, 15]]
+                leg_count = 0
+        else:
+            leg_count = 0
+        self._leg_cross_count[track_id] = leg_count
+
+        arm_count = self._arm_cross_count.get(track_id, 0)
+        if _arms_are_crossed(out, conf_thresh=0.15):
+            arm_count += 1
+            if arm_count >= self._CROSS_CORRECT_FRAMES:
+                out[[7, 8]]  = out[[8, 7]]
+                out[[9, 10]] = out[[10, 9]]
+                arm_count = 0
+        else:
+            arm_count = 0
+        self._arm_cross_count[track_id] = arm_count
+
         self._state[track_id] = out
         self._veloc[track_id] = new_vel
         return out
@@ -278,6 +314,56 @@ class PoseSmoother:
             if tid not in active_ids:
                 del self._state[tid]
                 self._veloc.pop(tid, None)
+                self._leg_cross_count.pop(tid, None)
+                self._arm_cross_count.pop(tid, None)
+
+
+# ---------------------------------------------------------------------------
+# Crossing-state helpers
+# ---------------------------------------------------------------------------
+
+def _segments_intersect(p1: np.ndarray, p2: np.ndarray,
+                         p3: np.ndarray, p4: np.ndarray) -> bool:
+    """True if line segment p1→p2 and p3→p4 intersect (excluding endpoints)."""
+    d1 = p2 - p1
+    d2 = p4 - p3
+    denom = d1[0] * d2[1] - d1[1] * d2[0]
+    if abs(denom) < 1e-10:
+        return False   # parallel / collinear
+    t = ((p3[0] - p1[0]) * d2[1] - (p3[1] - p1[1]) * d2[0]) / denom
+    u = ((p3[0] - p1[0]) * d1[1] - (p3[1] - p1[1]) * d1[0]) / denom
+    return 0.0 < t < 1.0 and 0.0 < u < 1.0
+
+
+def _legs_are_crossed(kp: np.ndarray, conf_thresh: float = 0.15) -> bool:
+    """
+    Return True if the left-leg line (left_hip→left_ankle) and right-leg line
+    (right_hip→right_ankle) geometrically intersect — an anatomically impossible
+    state that indicates a persistent label-swap error rather than a real crossing.
+
+    Uses hip (11,12) and ankle (15,16) only; knees aren't needed for this check
+    and are often the noisy joint during occlusion.
+    """
+    for i in (11, 12, 15, 16):
+        if kp[i, 2] < conf_thresh:
+            return False
+    return _segments_intersect(kp[11, :2], kp[15, :2],
+                                kp[12, :2], kp[16, :2])
+
+
+def _arms_are_crossed(kp: np.ndarray, conf_thresh: float = 0.15) -> bool:
+    """
+    Return True if the left-arm line (left_shoulder→left_wrist) and right-arm
+    line (right_shoulder→right_wrist) geometrically intersect.
+
+    Uses shoulders (5,6) and wrists (9,10); elbows are skipped for the same
+    reason knees are — they're noisier and not needed for the crossing check.
+    """
+    for i in (5, 6, 9, 10):
+        if kp[i, 2] < conf_thresh:
+            return False
+    return _segments_intersect(kp[5, :2], kp[9, :2],
+                                kp[6, :2], kp[10, :2])
 
 
 # ---------------------------------------------------------------------------
