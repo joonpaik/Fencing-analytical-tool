@@ -9,6 +9,7 @@ import cv2
 import math
 import time
 import numpy as np
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -273,6 +274,120 @@ class CrossingCorrector:
                 self._leg_cross_count.pop(tid, None)
                 self._arm_cross_count.pop(tid, None)
                 self._torso_cross_count.pop(tid, None)
+
+
+class LateralIdentityCorrector:
+    """
+    Detects and corrects persistent left/right label flips in a body-part chain.
+
+    Compares the lateral (x-axis) ordering of two *anchor* joints to two *check*
+    joints over a rolling window.  If the orderings persistently disagree the
+    listed swap_pairs are swapped to restore consistency.
+
+    The anchor joints are assumed reliable and are NEVER modified — only the
+    swap_pairs are touched.  This prevents the corrector from corrupting its own
+    reference point and avoids oscillation with the frame-level swap corrector.
+
+    Intended use — three instances, run in the order listed:
+      torso  anchor=shoulders(5,6),  check=hips(11,12),
+             swap_pairs=[(11,12)]                — fixes hip label flips
+      legs   anchor=hips(11,12),     check=ankles(15,16),
+             swap_pairs=[(13,14),(15,16)]        — fixes knee+ankle label flips
+      arms   anchor=shoulders(5,6),  check=wrists(9,10),
+             swap_pairs=[(7,8),(9,10)]           — fixes elbow+wrist label flips
+
+    Running torso first ensures the hip anchor is correct before the leg
+    corrector references it.
+
+    Ambiguity guard (optional, via proximity parameter):
+      When the two proximity joints are within ambiguity_dist pixels, history
+      accumulation is paused and is_ambiguous=True is returned.  The caller
+      should reduce Kalman gain for the affected joints that frame.  Once the
+      joints separate, a lower mismatch threshold fires faster to catch any swap
+      that occurred during contact before the history window fully refills.
+    """
+
+    def __init__(
+        self,
+        anchor          : Tuple[int, int],
+        check           : Tuple[int, int],
+        swap_pairs      : List[Tuple[int, int]],
+        proximity       : Optional[Tuple[int, int]] = None,
+        ambiguity_dist  : float = 50.0,
+        history_len     : int   = 15,
+        flip_ratio      : float = 0.70,
+        post_cross_ratio: float = 0.50,
+        conf_thresh     : float = 0.15,
+    ):
+        self._anchor          = anchor
+        self._check           = check
+        self._swap_pairs      = swap_pairs
+        self._proximity       = proximity
+        self._ambiguity_dist  = ambiguity_dist
+        self._history_len     = history_len
+        self._flip_ratio      = flip_ratio
+        self._post_cross_ratio= post_cross_ratio
+        self._conf_thresh     = conf_thresh
+        self._history        : dict = {}  # track_id -> deque[bool]
+        self._prev_ambiguous : dict = {}  # track_id -> bool
+
+    def apply(self, track_id: int, kp: np.ndarray) -> Tuple[np.ndarray, bool]:
+        """
+        Returns (corrected_kp, is_ambiguous).
+
+        corrected_kp  — swap_pairs swapped when a persistent identity flip is
+                        detected; otherwise identical to input.
+        is_ambiguous  — True when the proximity joints are too close to reliably
+                        determine correct labeling.
+        """
+        kp = kp.copy()
+        al, ar = self._anchor
+        cl, cr = self._check
+
+        for i in (al, ar, cl, cr):
+            if kp[i, 2] < self._conf_thresh:
+                return kp, False
+
+        # Proximity / ambiguity check
+        is_ambiguous = False
+        if self._proximity is not None:
+            pl, pr = self._proximity
+            if kp[pl, 2] >= self._conf_thresh and kp[pr, 2] >= self._conf_thresh:
+                dist = math.hypot(float(kp[pl, 0] - kp[pr, 0]),
+                                  float(kp[pl, 1] - kp[pr, 1]))
+                is_ambiguous = dist < self._ambiguity_dist
+
+        was_ambiguous = self._prev_ambiguous.get(track_id, False)
+        self._prev_ambiguous[track_id] = is_ambiguous
+
+        if not is_ambiguous:
+            a_sign = np.sign(kp[al, 0] - kp[ar, 0])
+            c_sign = np.sign(kp[cl, 0] - kp[cr, 0])
+            signs_match = bool(a_sign == c_sign)
+
+            hist = self._history.setdefault(track_id, deque(maxlen=self._history_len))
+            hist.append(signs_match)
+
+            # After ambiguity: shorter minimum window + lower threshold so a swap
+            # is caught quickly before the history refills.
+            min_frames = 3 if was_ambiguous else max(3, self._history_len // 3)
+            if len(hist) >= min_frames:
+                mismatch_frac = sum(1 for v in hist if not v) / len(hist)
+                threshold = self._post_cross_ratio if was_ambiguous else self._flip_ratio
+
+                if mismatch_frac >= threshold:
+                    for lp, rp in self._swap_pairs:
+                        kp[[lp, rp]] = kp[[rp, lp]]
+                    hist.clear()   # reset so we don't trigger again next frame
+
+        return kp, is_ambiguous
+
+    def prune(self, active_ids: set):
+        """Remove state for tracks no longer active."""
+        for tid in list(self._history):
+            if tid not in active_ids:
+                del self._history[tid]
+                self._prev_ambiguous.pop(tid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -592,10 +707,38 @@ class YoloPoseEngine:
         pt_path = self.MODELS_DIR / pt_name
         if not pt_path.exists():
             raise FileNotFoundError(f"YOLO pose model not found: {pt_path}")
-        self._yolo               = YOLO(str(pt_path))
-        self._kalman             = KalmanPoseFilter()   # Layer 3: state estimation
-        self._swap_corrector     = SwapCorrector()      # Layer 4a: swap correction
-        self._crossing_corrector = CrossingCorrector()  # Layer 4b: crossing correction + state
+        self._yolo           = YOLO(str(pt_path))
+        self._kalman         = KalmanPoseFilter()   # Layer 3: state estimation
+        self._swap_corrector = SwapCorrector()       # Layer 4a: frame-level swap
+
+        # Layer 4b–4d: persistent lateral-flip correctors.
+        # Run in this order so each corrector's anchor joints are already clean
+        # before the next one runs: torso fixes hips → legs use hips as anchor →
+        # arms use shoulders as anchor (independent of the lower body).
+        self._torso_corrector = LateralIdentityCorrector(
+            anchor     = (5,  6),           # shoulders — reliable anchor
+            check      = (11, 12),          # hips — potentially flipped
+            swap_pairs = [(11, 12)],        # only swap hips; legs have their own corrector
+            proximity  = None,              # same person's hips don't approach each other
+        )
+        self._leg_corrector = LateralIdentityCorrector(
+            anchor     = (11, 12),          # hips (corrected by torso corrector above)
+            check      = (15, 16),          # ankles — far end of leg chain
+            swap_pairs = [(13, 14), (15, 16)],  # swap knees + ankles
+            proximity  = (15, 16),          # ankles close together → ambiguous
+        )
+        self._arm_corrector = LateralIdentityCorrector(
+            anchor     = (5,  6),           # shoulders — reliable anchor (NOT swapped)
+            check      = (9,  10),          # wrists — far end of arm chain
+            swap_pairs = [(7, 8), (9, 10)], # swap elbows + wrists only
+            proximity  = (9,  10),          # wrists close together → ambiguous
+        )
+        self._crossing_corrector = CrossingCorrector()  # Layer 4e: geometric crossing + state
+
+        # Ambiguity flags from the lateral correctors feed back into _estimate()
+        # to clamp Kalman gain for the affected joints next frame.
+        self._arm_ambiguous: dict = {}
+        self._leg_ambiguous: dict = {}
         print(f"[YoloPoseEngine] mode=yolo_pose  model={pt_name}")
 
         # Canonical two-fencer state. IDs are fixed as 1 and 2.
@@ -1183,7 +1326,20 @@ class YoloPoseEngine:
                 out_box = prev_box
             else:
                 self._prev_boxes[track_id] = box
-                kp_filtered = self._kalman.update(track_id, d['kp'])
+                # If a lateral corrector flagged ambiguity last frame, clamp the
+                # affected joints' confidence to 0.05 so K stays near its minimum
+                # (~0.23).  The filter trusts its own prediction over the unreliable
+                # raw measurement during contact / close-proximity frames.
+                kp_in = d['kp']
+                arm_amb = self._arm_ambiguous.get(track_id, False)
+                leg_amb = self._leg_ambiguous.get(track_id, False)
+                if arm_amb or leg_amb:
+                    kp_in = d['kp'].copy()
+                    if arm_amb:
+                        kp_in[7:11, 2] = np.minimum(kp_in[7:11, 2], 0.05)
+                    if leg_amb:
+                        kp_in[13:17, 2] = np.minimum(kp_in[13:17, 2], 0.05)
+                kp_filtered = self._kalman.update(track_id, kp_in)
                 out_box = box
 
             # 5.1 Periodic velocity reset applied after the Kalman step so the
@@ -1212,13 +1368,21 @@ class YoloPoseEngine:
 
     def _correct(self, estimated: List[dict]) -> List[dict]:
         """
-        4a  Swap correction   — _swap_corrector.apply(kp, kp_prev)
-            Only on accepted detections (jumped=False) with a prior reference.
-            Skipped on Kalman-predict frames — no new measurement to compare.
+        4a  Swap correction         — frame-level left/right check vs kp_prev.
+            Skipped on Kalman-predict frames (jumped=True).
 
-        4b  Crossing correction — _crossing_corrector.apply(track_id, kp)
-            Stores corrected result as canonical state so next frame's kp_prev
-            is the post-correction reference.
+        4b  Torso identity correction — fix persistent hip-label flips, anchored
+            by shoulders.  Runs first so the leg corrector has a clean hip anchor.
+
+        4c  Leg identity correction  — fix persistent knee+ankle label flips,
+            anchored by (now-correct) hips.
+
+        4d  Arm identity correction  — fix persistent elbow+wrist label flips,
+            anchored by shoulders.
+
+        4e  Geometric crossing correction — 8-frame temporal pressure on segment
+            intersections.  Always last so it stores the final corrected kp as
+            canonical state for next frame's kp_prev reference.
         """
         corrected = []
         for d in estimated:
@@ -1226,15 +1390,37 @@ class YoloPoseEngine:
             kp       = d['kp_filtered']
             kp_prev  = d['kp_prev']
 
+            # 4a — frame-level swap
             if not d['jumped'] and kp_prev is not None:
                 kp_orig = kp.copy() if self._debug else None
                 kp = self._swap_corrector.apply(kp, kp_prev)
                 if self._debug and not np.array_equal(kp[:, :2], kp_orig[:, :2]):
                     print(f"[F{self._frame_id}] Slot {track_id}: left/right swap applied")
 
-            kp_pre_cross = kp.copy() if self._debug else None
+            # 4b — torso (hips anchored by shoulders)
+            kp_pre = kp.copy() if self._debug else None
+            kp, _ = self._torso_corrector.apply(track_id, kp)
+            if self._debug and not np.array_equal(kp[:, :2], kp_pre[:, :2]):
+                print(f"[F{self._frame_id}] Slot {track_id}: torso identity correction applied")
+
+            # 4c — legs (knees+ankles anchored by hips)
+            kp_pre = kp.copy() if self._debug else None
+            kp, leg_amb = self._leg_corrector.apply(track_id, kp)
+            self._leg_ambiguous[track_id] = leg_amb
+            if self._debug and not np.array_equal(kp[:, :2], kp_pre[:, :2]):
+                print(f"[F{self._frame_id}] Slot {track_id}: leg identity correction applied")
+
+            # 4d — arms (elbows+wrists anchored by shoulders)
+            kp_pre = kp.copy() if self._debug else None
+            kp, arm_amb = self._arm_corrector.apply(track_id, kp)
+            self._arm_ambiguous[track_id] = arm_amb
+            if self._debug and not np.array_equal(kp[:, :2], kp_pre[:, :2]):
+                print(f"[F{self._frame_id}] Slot {track_id}: arm identity correction applied")
+
+            # 4e — geometric crossing (writes canonical state)
+            kp_pre = kp.copy() if self._debug else None
             kp = self._crossing_corrector.apply(track_id, kp)
-            if self._debug and not np.array_equal(kp[:, :2], kp_pre_cross[:, :2]):
+            if self._debug and not np.array_equal(kp[:, :2], kp_pre[:, :2]):
                 print(f"[F{self._frame_id}] Slot {track_id}: crossing correction applied")
 
             corrected.append({**d, 'kp_corrected': kp})
@@ -1267,6 +1453,9 @@ class YoloPoseEngine:
                 self._reject_counts.pop(slot, None)
 
         self._kalman.prune(active_ids)
+        self._torso_corrector.prune(active_ids)
+        self._leg_corrector.prune(active_ids)
+        self._arm_corrector.prune(active_ids)
         self._crossing_corrector.prune(active_ids)
         # _swap_corrector is stateless — no pruning needed
         self._frame_id += 1
@@ -1284,5 +1473,5 @@ if __name__ == "__main__":
     # --- Mode 1: YOLO pose model (one-pass, fastest) ---
     print("\n=== Mode: yolo_pose ===")
     with YoloPoseEngine(model_size='s') as engine:
-        engine.process_video(video, skeleton_only=False)
+        engine.process_video(video, skeleton_only=True)
 
