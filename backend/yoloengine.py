@@ -308,6 +308,26 @@ class PoseSmoother:
         self._veloc[track_id] = new_vel
         return out
 
+    def extrapolate(self, track_id: int) -> Optional[np.ndarray]:
+        """
+        Advance the smoother one step using velocity-decay prediction only,
+        without consuming a new YOLO detection.  Used when a detection is
+        rejected (e.g. bounding-box jump).  Confidence values are kept from
+        the last real detection so cross/swap logic stays valid next frame.
+        """
+        if track_id not in self._state:
+            return None
+        prev     = self._state[track_id]
+        prev_vel = self._veloc[track_id]
+        out      = prev.copy()
+        new_vel  = np.zeros_like(prev_vel)
+        for idx in range(len(prev)):
+            out[idx, :2] = prev[idx, :2] + prev_vel[idx]
+            new_vel[idx] = prev_vel[idx] * self._VEL_DECAY
+        self._state[track_id] = out
+        self._veloc[track_id] = new_vel
+        return out
+
     def prune(self, active_ids: set):
         """Remove state for track IDs no longer present in the frame."""
         for tid in list(self._state):
@@ -577,6 +597,12 @@ class YoloPoseEngine:
             2: {'raw_id': None, 'center': None, 'misses': 0},
         }
         self._max_state_misses = 45
+
+        # Box-jump guard — if a detection's box centre moves more than this many
+        # pixels from the previous accepted centre, it likely grabbed a background
+        # object.  The detection is rejected and the smoother extrapolates instead.
+        self._BOX_JUMP_THRESH = 200  # px
+        self._prev_boxes: dict = {}  # slot -> last accepted (x1,y1,x2,y2)
 
     # ------------------------------------------------------------------
     # Public API
@@ -856,15 +882,39 @@ class YoloPoseEngine:
             track_id = d['track_id']
             active_ids.add(track_id)
 
-            kp_data = self._smoother.smooth(track_id, d['kp'])
+            box = d['box']
+            prev_box = self._prev_boxes.get(track_id)
+            if prev_box is not None:
+                curr_c = self._box_center(box)
+                prev_c = self._box_center(prev_box)
+                if math.hypot(curr_c[0] - prev_c[0], curr_c[1] - prev_c[1]) > self._BOX_JUMP_THRESH:
+                    # Detection grabbed background — discard it entirely.
+                    # The bad keypoints never touch the fencer's smoother state.
+                    # Extrapolate from the last clean frame; _prev_boxes unchanged.
+                    kp_data = self._smoother.extrapolate(track_id)
+                    if kp_data is None:
+                        continue
+                    box = prev_box
+                else:
+                    self._prev_boxes[track_id] = box
+                    kp_data = self._smoother.smooth(track_id, d['kp'])
+            else:
+                self._prev_boxes[track_id] = box
+                kp_data = self._smoother.smooth(track_id, d['kp'])
+
             angles = _extract_angles_coco(kp_data)
             pose = PersonPose(
                 track_id=track_id,
-                box=d['box'],
+                box=box,
                 keypoints=kp_data.tolist(),
                 **angles,
             )
             poses.append(pose)
+
+        # Clean up prev_boxes for tracks that are no longer active.
+        for slot in list(self._prev_boxes):
+            if slot not in active_ids:
+                del self._prev_boxes[slot]
 
         self._smoother.prune(active_ids)
         return sorted(poses, key=lambda p: p.track_id)
@@ -890,8 +940,30 @@ class YoloPoseEngine:
         active_ids = set()
 
         for d in assigned:
-            x1, y1, x2, y2 = d['box']
             track_id = d['track_id']
+            box = d['box']
+            x1, y1, x2, y2 = box
+
+            prev_box = self._prev_boxes.get(track_id)
+            if prev_box is not None:
+                curr_c = self._box_center(box)
+                prev_c = self._box_center(prev_box)
+                if math.hypot(curr_c[0] - prev_c[0], curr_c[1] - prev_c[1]) > self._BOX_JUMP_THRESH:
+                    # Detection grabbed background — discard entirely; skip MediaPipe crop.
+                    kp_arr = self._smoother.extrapolate(track_id)
+                    if kp_arr is None:
+                        continue
+                    active_ids.add(track_id)
+                    angles = _extract_angles_coco(kp_arr)
+                    poses.append(PersonPose(
+                        track_id=track_id,
+                        box=prev_box,
+                        keypoints=kp_arr.tolist(),
+                        **angles,
+                    ))
+                    continue
+            self._prev_boxes[track_id] = box
+
             crop = frame[y1:y2, x1:x2]
             if crop.size == 0:
                 continue
@@ -920,11 +992,16 @@ class YoloPoseEngine:
 
             pose = PersonPose(
                 track_id=track_id,
-                box=(x1, y1, x2, y2),
+                box=box,
                 keypoints=kp_arr.tolist(),
                 **angles,
             )
             poses.append(pose)
+
+        # Clean up prev_boxes for tracks that are no longer active.
+        for slot in list(self._prev_boxes):
+            if slot not in active_ids:
+                del self._prev_boxes[slot]
 
         self._smoother.prune(active_ids)
         return sorted(poses, key=lambda p: p.track_id)
