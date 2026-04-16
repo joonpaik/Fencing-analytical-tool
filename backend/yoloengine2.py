@@ -460,24 +460,39 @@ class KalmanPoseFilter:
 
         # --- measurement update (confidence-scaled Kalman gain) ---
         confs = np.clip(kp[:, 2], 0.0, 1.0).astype(np.float32)
-        K     = np.clip(0.2 + 0.6 * confs, 0.2, 0.8)
+        K     = np.clip(0.15 + 0.45 * confs, 0.2, 0.65)
+
+        # --- measurement gating (5.3) ---
+        # Gate calibrated from observed data: max legitimate per-frame displacement
+        # is ~39 px (weapon-arm wrist strike); YOLO left/right leg swap errors are
+        # always ≥105 px.  55 px sits firmly between the two populations.
+        # Gated joints get K=0.1 so the filter coasts on its own prediction
+        # instead of snapping to the erroneous measurement.
+        _OUTLIER_GATE = 55.0
+        meas_dist = np.sqrt((kp[:, 0] - x_pred) ** 2 + (kp[:, 1] - y_pred) ** 2)
+        outlier   = meas_dist > _OUTLIER_GATE
+        K = np.where(outlier, 0.1, K)
 
         x_new = x_pred + K * (kp[:, 0] - x_pred)
         y_new = y_pred + K * (kp[:, 1] - y_pred)
 
-        # --- strong re-anchor (5.3) ---
-        # High-confidence joints snap harder to the measurement to prevent
-        # accumulated Kalman drift from persisting through strong detections.
-        strong = confs > 0.8
-        if strong.any():
-            x_new = np.where(strong, 0.8 * kp[:, 0] + 0.2 * x_pred, x_new)
-            y_new = np.where(strong, 0.8 * kp[:, 1] + 0.2 * y_pred, y_new)
-
-        # velocity = total corrected displacement over one frame
+        # --- EMA velocity smoothing (5.4) ---
+        # For accepted measurements, base velocity on the raw measurement
+        # displacement so the prediction tracks actual speed (not the K-scaled
+        # filtered displacement, which always undershoots during fast motion).
+        # For gated (outlier) measurements, use 0 so the EMA decays velocity
+        # to near-zero over ~3 frames. Using filtered displacement instead
+        # would slowly drift the state toward the wrong position, causing the
+        # correct measurement to appear as an outlier once YOLO recovers.
+        _VEL_ALPHA = 0.5
+        raw_vel_x = kp[:, 0] - x_prev
+        raw_vel_y = kp[:, 1] - y_prev
+        vel_src_x = np.where(outlier, 0.0, raw_vel_x)
+        vel_src_y = np.where(outlier, 0.0, raw_vel_y)
         s[:, 0] = x_new
         s[:, 1] = y_new
-        s[:, 2] = x_new - x_prev
-        s[:, 3] = y_new - y_prev
+        s[:, 2] = (1.0 - _VEL_ALPHA) * s[:, 2] + _VEL_ALPHA * vel_src_x
+        s[:, 3] = (1.0 - _VEL_ALPHA) * s[:, 3] + _VEL_ALPHA * vel_src_y
 
         out = np.empty((len(kp), 3), dtype=np.float32)
         out[:, 0] = x_new
@@ -765,7 +780,9 @@ class YoloPoseEngine:
         # before a detection is treated as a background grab.
         self._BOX_JUMP_BASE  = 100.0   # px — minimum threshold (at rest)
         self._BOX_JUMP_SCALE =   2.0   # px per px/frame of velocity
-        self._prev_boxes: dict = {}    # slot -> last accepted (x1,y1,x2,y2)
+        self._prev_boxes: dict = {}    # slot -> last accepted raw (x1,y1,x2,y2)
+        self._smooth_boxes: dict = {}  # slot -> EMA-smoothed (x1,y1,x2,y2) for output
+        self._BOX_EMA_ALPHA  = 0.35    # smoothing strength (lower = smoother box)
         self._reject_counts: dict = {} # slot -> consecutive box-jump rejections
 
         # Frame counter — used for periodic Kalman velocity reset (5.1)
@@ -1326,21 +1343,46 @@ class YoloPoseEngine:
                 out_box = prev_box
             else:
                 self._prev_boxes[track_id] = box
+                # EMA-smooth the box for output so the rectangle doesn't jump
+                # with raw YOLO noise while the keypoints are Kalman-filtered.
+                prev_smooth = self._smooth_boxes.get(track_id)
+                if prev_smooth is None:
+                    self._smooth_boxes[track_id] = box
+                else:
+                    a = self._BOX_EMA_ALPHA
+                    self._smooth_boxes[track_id] = (
+                        int(a * box[0] + (1 - a) * prev_smooth[0]),
+                        int(a * box[1] + (1 - a) * prev_smooth[1]),
+                        int(a * box[2] + (1 - a) * prev_smooth[2]),
+                        int(a * box[3] + (1 - a) * prev_smooth[3]),
+                    )
+                # Pre-Kalman swap correction: fix YOLO left/right label swaps on
+                # the raw measurement before the filter ingests them.
+                # Running it only after Kalman (Layer 4a in _correct()) means the
+                # filter has already pulled its state toward the swapped positions,
+                # building velocity in the wrong direction.  On raw kp the cost
+                # comparison is unambiguous (e.g. cost_keep=74 vs cost_swap=4),
+                # whereas post-Kalman averaging can make the two costs nearly equal
+                # and the inertia check fails to trigger.
+                kp_in = d['kp']
+                if kp_prev is not None:
+                    kp_in = self._swap_corrector.apply(kp_in, kp_prev)
+
                 # If a lateral corrector flagged ambiguity last frame, clamp the
                 # affected joints' confidence to 0.05 so K stays near its minimum
                 # (~0.23).  The filter trusts its own prediction over the unreliable
                 # raw measurement during contact / close-proximity frames.
-                kp_in = d['kp']
                 arm_amb = self._arm_ambiguous.get(track_id, False)
                 leg_amb = self._leg_ambiguous.get(track_id, False)
                 if arm_amb or leg_amb:
-                    kp_in = d['kp'].copy()
+                    if kp_in is d['kp']:   # ensure we hold a private copy
+                        kp_in = kp_in.copy()
                     if arm_amb:
                         kp_in[7:11, 2] = np.minimum(kp_in[7:11, 2], 0.05)
                     if leg_amb:
                         kp_in[13:17, 2] = np.minimum(kp_in[13:17, 2], 0.05)
                 kp_filtered = self._kalman.update(track_id, kp_in)
-                out_box = box
+                out_box = self._smooth_boxes.get(track_id, box)
 
             # 5.1 Periodic velocity reset applied after the Kalman step so the
             # current frame's output is unaffected; the reset takes effect next frame.
@@ -1450,6 +1492,7 @@ class YoloPoseEngine:
         for slot in list(self._prev_boxes):
             if slot not in active_ids:
                 del self._prev_boxes[slot]
+                self._smooth_boxes.pop(slot, None)
                 self._reject_counts.pop(slot, None)
 
         self._kalman.prune(active_ids)
@@ -1473,5 +1516,5 @@ if __name__ == "__main__":
     # --- Mode 1: YOLO pose model (one-pass, fastest) ---
     print("\n=== Mode: yolo_pose ===")
     with YoloPoseEngine(model_size='s') as engine:
-        engine.process_video(video, skeleton_only=True)
+        engine.process_video(video, skeleton_only=False)
 
