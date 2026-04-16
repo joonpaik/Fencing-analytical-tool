@@ -31,8 +31,8 @@ from yoloengine2 import YoloPoseEngine, YOLO_COCO_NAMES
 VIDEO    = Config.PROJECT_ROOT / "sample" / "fencing2.mp4"
 OUT_CSV  = Config.OUTPUT_DIR / "jitter_trace.csv"
 # Frames ~0:06–0:12 at 30fps = 180–360; add a small margin.
-START_FRAME = 180
-END_FRAME   = 370
+START_FRAME = 1500
+END_FRAME   = 1650
 SLOT        = None   # None = both slots; or 1 / 2 to restrict
 
 # Joint indices we care about most (upper body — where jitter is visible)

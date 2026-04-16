@@ -1313,9 +1313,16 @@ class YoloPoseEngine:
             if self._reject_counts[track_id] > 5:
                 jump_detected = False
                 self._reject_counts[track_id] = 0
+                # Reset Kalman state so the filter bootstraps from the new
+                # detection position immediately.  Without this, the Kalman
+                # state stays at the old (wrong) position and all joints remain
+                # gated for ~25 more frames while K=0.1 slowly drifts toward
+                # the correct position — producing visible skeleton displacement.
+                self._kalman._state.pop(track_id, None)
+                self._smooth_boxes.pop(track_id, None)
                 if self._debug:
                     print(f"[F{self._frame_id}] Slot {track_id}: recovery triggered "
-                          f"(forced accept after 5 consecutive rejections)")
+                          f"(forced accept + Kalman reset after 5 consecutive rejections)")
 
             # Snapshot post-correction state for swap detection in _correct().
             kp_prev = self._crossing_corrector.get_prev(track_id)
