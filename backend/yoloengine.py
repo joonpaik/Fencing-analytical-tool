@@ -233,8 +233,9 @@ class PoseSmoother:
         self.conf_gate  = conf_gate
         self._state: dict  = {}   # track_id -> smoothed (N, 3) np.ndarray
         self._veloc: dict  = {}   # track_id -> last velocity (N, 2) np.ndarray
-        self._leg_cross_count: dict = {}  # track_id -> consecutive crossed-leg frames
-        self._arm_cross_count: dict = {}  # track_id -> consecutive crossed-arm frames
+        self._leg_cross_count: dict = {}    # track_id -> consecutive crossed-leg frames
+        self._arm_cross_count: dict = {}    # track_id -> consecutive crossed-arm frames
+        self._torso_cross_count: dict = {}  # track_id -> consecutive crossed-torso frames
 
     def smooth(self, track_id: int, kp: np.ndarray) -> np.ndarray:
         if track_id not in self._state:
@@ -304,6 +305,17 @@ class PoseSmoother:
             arm_count = 0
         self._arm_cross_count[track_id] = arm_count
 
+        torso_count = self._torso_cross_count.get(track_id, 0)
+        if _torso_is_crossed(out, conf_thresh=0.15):
+            torso_count += 1
+            if torso_count >= self._CROSS_CORRECT_FRAMES:
+                out[[5, 6]]   = out[[6, 5]]
+                out[[11, 12]] = out[[12, 11]]
+                torso_count = 0
+        else:
+            torso_count = 0
+        self._torso_cross_count[track_id] = torso_count
+
         self._state[track_id] = out
         self._veloc[track_id] = new_vel
         return out
@@ -336,6 +348,7 @@ class PoseSmoother:
                 self._veloc.pop(tid, None)
                 self._leg_cross_count.pop(tid, None)
                 self._arm_cross_count.pop(tid, None)
+                self._torso_cross_count.pop(tid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +397,19 @@ def _arms_are_crossed(kp: np.ndarray, conf_thresh: float = 0.15) -> bool:
             return False
     return _segments_intersect(kp[5, :2], kp[9, :2],
                                 kp[6, :2], kp[10, :2])
+
+
+def _torso_is_crossed(kp: np.ndarray, conf_thresh: float = 0.15) -> bool:
+    """
+    Return True if the left-torso line (left_shoulder→left_hip) and right-torso
+    line (right_shoulder→right_hip) geometrically intersect — indicating that
+    either the shoulder or hip labels (or both) have been persistently swapped.
+    """
+    for i in (5, 6, 11, 12):
+        if kp[i, 2] < conf_thresh:
+            return False
+    return _segments_intersect(kp[5, :2], kp[11, :2],
+                                kp[6, :2], kp[12, :2])
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +789,28 @@ class YoloPoseEngine:
         x1, y1, x2, y2 = box
         return max(0, x2 - x1) * max(0, y2 - y1)
 
+    @staticmethod
+    def _box_from_keypoints(
+        kp: np.ndarray,
+        ref_box: Tuple[int, int, int, int],
+        conf_thresh: float = 0.1,
+    ) -> Tuple[int, int, int, int]:
+        """
+        Build an updated reference box whose centre tracks the extrapolated
+        keypoint centroid while preserving the width/height of ref_box.
+        Used to advance _prev_boxes during background-grab frames so that a
+        valid YOLO recovery is not falsely rejected as another jump.
+        """
+        visible = kp[kp[:, 2] > conf_thresh, :2]
+        if len(visible) == 0:
+            return ref_box
+        cx = float(visible[:, 0].mean())
+        cy = float(visible[:, 1].mean())
+        x1, y1, x2, y2 = ref_box
+        hw = (x2 - x1) / 2.0
+        hh = (y2 - y1) / 2.0
+        return (int(cx - hw), int(cy - hh), int(cx + hw), int(cy + hh))
+
     def _select_two_fencers(self, detections: List[dict]) -> List[dict]:
         """Pick at most two best person candidates (largest boxes)."""
         if len(detections) <= 2:
@@ -890,11 +938,14 @@ class YoloPoseEngine:
                 if math.hypot(curr_c[0] - prev_c[0], curr_c[1] - prev_c[1]) > self._BOX_JUMP_THRESH:
                     # Detection grabbed background — discard it entirely.
                     # The bad keypoints never touch the fencer's smoother state.
-                    # Extrapolate from the last clean frame; _prev_boxes unchanged.
                     kp_data = self._smoother.extrapolate(track_id)
                     if kp_data is None:
                         continue
                     box = prev_box
+                    # Advance the reference box so the next valid YOLO detection
+                    # isn't falsely rejected because the fencer kept moving while
+                    # _prev_boxes was frozen.
+                    self._prev_boxes[track_id] = self._box_from_keypoints(kp_data, prev_box)
                 else:
                     self._prev_boxes[track_id] = box
                     kp_data = self._smoother.smooth(track_id, d['kp'])
@@ -954,6 +1005,8 @@ class YoloPoseEngine:
                     if kp_arr is None:
                         continue
                     active_ids.add(track_id)
+                    # Advance the reference box with the extrapolated position.
+                    self._prev_boxes[track_id] = self._box_from_keypoints(kp_arr, prev_box)
                     angles = _extract_angles_coco(kp_arr)
                     poses.append(PersonPose(
                         track_id=track_id,
@@ -1029,7 +1082,7 @@ def _draw_skeleton_mp_from_kp(frame, kp: np.ndarray):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    video = Config.PROJECT_ROOT / "sample" / "fencing2.mp4"
+    video = Config.PROJECT_ROOT / "sample" / "fencing.mp4"
 
     # --- Mode 1: YOLO pose model (one-pass, fastest) ---
     print("\n=== Mode: yolo_pose ===")
