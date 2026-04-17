@@ -390,6 +390,46 @@ class LateralIdentityCorrector:
                 self._prev_ambiguous.pop(tid, None)
 
 
+class PoseOutputSmoother:
+    """
+    Layer 5b — Confidence-scaled EMA on final corrected keypoints.
+
+    Applied after all corrections (swap, identity, crossing) and before
+    PersonPose construction.  Absorbs residual per-frame noise that leaks
+    through the correction pipeline without affecting tracking logic.
+
+    Alpha scales with per-joint confidence so high-confidence joints
+    track the measurement closely while low-confidence joints are smoothed
+    more aggressively:
+
+        alpha = clip(0.5 + 0.4 * conf, 0.5, 0.9)
+
+    Example: conf=0.9 → alpha≈0.86 (86% current, 14% history)
+             conf=0.3 → alpha≈0.62 (62% current, 38% history)
+
+    Only positions (x, y) are smoothed; confidence is passed through.
+    """
+
+    def __init__(self):
+        self._state: dict = {}   # track_id -> (N, 2) smoothed positions
+
+    def apply(self, track_id: int, kp: np.ndarray) -> np.ndarray:
+        out = kp.copy()
+        alpha = np.clip(0.5 + 0.4 * kp[:, 2], 0.5, 0.9).astype(np.float32)[:, None]
+        if track_id not in self._state:
+            self._state[track_id] = kp[:, :2].copy()
+            return out
+        self._state[track_id] = (alpha * kp[:, :2]
+                                  + (1.0 - alpha) * self._state[track_id])
+        out[:, :2] = self._state[track_id]
+        return out
+
+    def prune(self, active_ids: set):
+        for tid in list(self._state):
+            if tid not in active_ids:
+                del self._state[tid]
+
+
 # ---------------------------------------------------------------------------
 # Kalman filter — Layer 3 state estimation
 # ---------------------------------------------------------------------------
@@ -462,15 +502,18 @@ class KalmanPoseFilter:
         confs = np.clip(kp[:, 2], 0.0, 1.0).astype(np.float32)
         K     = np.clip(0.15 + 0.45 * confs, 0.2, 0.65)
 
-        # --- measurement gating (5.3) ---
-        # Gate calibrated from observed data: max legitimate per-frame displacement
-        # is ~39 px (weapon-arm wrist strike); YOLO left/right leg swap errors are
-        # always ≥105 px.  55 px sits firmly between the two populations.
-        # Gated joints get K=0.1 so the filter coasts on its own prediction
-        # instead of snapping to the erroneous measurement.
-        _OUTLIER_GATE = 55.0
+        # --- measurement gating (5.3 — velocity-adaptive) ---
+        # Base gate of 40 px rejects static swap errors (YOLO label swaps ≥105 px).
+        # The gate scales with the joint's current Kalman velocity so fast-moving
+        # joints (lunges, strikes) are not incorrectly frozen: a wrist at 30 px/frame
+        # gets gate = max(40, 3×30) = 90 px, wide enough to track a real strike.
+        _OUTLIER_GATE_BASE = 40.0   # minimum gate for stationary joints
+        _OUTLIER_GATE_VEL  = 3.0    # gate = max(base, vel_scale × joint_vel_mag)
+        joint_vel_mag = np.sqrt(s[:, 2] ** 2 + s[:, 3] ** 2)
+        adaptive_gate = np.maximum(_OUTLIER_GATE_BASE,
+                                   _OUTLIER_GATE_VEL * joint_vel_mag)
         meas_dist = np.sqrt((kp[:, 0] - x_pred) ** 2 + (kp[:, 1] - y_pred) ** 2)
-        outlier   = meas_dist > _OUTLIER_GATE
+        outlier   = meas_dist > adaptive_gate
         K = np.where(outlier, 0.1, K)
 
         x_new = x_pred + K * (kp[:, 0] - x_pred)
@@ -509,6 +552,22 @@ class KalmanPoseFilter:
         if track_id in self._state:
             self._state[track_id][:, 2] = 0.0
             self._state[track_id][:, 3] = 0.0
+
+    def warp_to(self, track_id: int, kp: np.ndarray):
+        """
+        Teleport state positions to match kp and zero velocity.
+
+        Used during reject-count recovery instead of popping the state entirely.
+        Popping causes the next update() to bootstrap cold, snapping the skeleton
+        to the raw YOLO position.  warp_to() instead places the filter at the
+        correct position with zero velocity so the subsequent update() runs with
+        normal gain (no outlier gating) and the transition is smooth.
+        """
+        if track_id not in self._state:
+            return
+        s = self._state[track_id]
+        s[:, :2] = kp[:, :2]   # set positions to new detection
+        s[:, 2:] = 0.0          # zero velocity — let the filter re-estimate it
 
     def get_state(self, track_id: int) -> Optional[np.ndarray]:
         """Current internal state (N, 4) [x, y, vx, vy], or None."""
@@ -779,7 +838,7 @@ class YoloPoseEngine:
         # Faster-moving fencers get a proportionally larger allowed displacement
         # before a detection is treated as a background grab.
         self._BOX_JUMP_BASE  = 100.0   # px — minimum threshold (at rest)
-        self._BOX_JUMP_SCALE =   2.0   # px per px/frame of velocity
+        self._BOX_JUMP_SCALE =   3.5   # px per px/frame of velocity
         self._prev_boxes: dict = {}    # slot -> last accepted raw (x1,y1,x2,y2)
         self._smooth_boxes: dict = {}  # slot -> EMA-smoothed (x1,y1,x2,y2) for output
         self._BOX_EMA_ALPHA  = 0.35    # smoothing strength (lower = smoother box)
@@ -788,6 +847,9 @@ class YoloPoseEngine:
         # Frame counter — used for periodic Kalman velocity reset (5.1)
         self._frame_id: int = 0
         self._VEL_RESET_INTERVAL: int = 300   # frames (~10 s at 30 fps)
+
+        # Layer 5b — output smoother: final EMA on corrected keypoints
+        self._output_smoother = PoseOutputSmoother()
 
         # Debug mode — visual overlays + per-event logging
         self._debug: bool = debug
@@ -1313,12 +1375,12 @@ class YoloPoseEngine:
             if self._reject_counts[track_id] > 5:
                 jump_detected = False
                 self._reject_counts[track_id] = 0
-                # Reset Kalman state so the filter bootstraps from the new
-                # detection position immediately.  Without this, the Kalman
-                # state stays at the old (wrong) position and all joints remain
-                # gated for ~25 more frames while K=0.1 slowly drifts toward
-                # the correct position — producing visible skeleton displacement.
-                self._kalman._state.pop(track_id, None)
+                # Warp Kalman state to the new detection position with zeroed
+                # velocity instead of popping state entirely.  A hard pop causes
+                # the next update() to bootstrap cold, snapping the skeleton;
+                # warp_to() places the filter at the correct position so the
+                # subsequent update() runs with normal gain and no outlier gating.
+                self._kalman.warp_to(track_id, d['kp'])
                 self._smooth_boxes.pop(track_id, None)
                 if self._debug:
                     print(f"[F{self._frame_id}] Slot {track_id}: recovery triggered "
@@ -1488,11 +1550,12 @@ class YoloPoseEngine:
         for d in corrected:
             track_id = d['track_id']
             active_ids.add(track_id)
-            angles = _extract_angles_coco(d['kp_corrected'])
+            kp_out = self._output_smoother.apply(track_id, d['kp_corrected'])
+            angles = _extract_angles_coco(kp_out)
             poses.append(PersonPose(
                 track_id=track_id,
                 box=d['box'],
-                keypoints=d['kp_corrected'].tolist(),
+                keypoints=kp_out.tolist(),
                 **angles,
             ))
 
@@ -1503,6 +1566,7 @@ class YoloPoseEngine:
                 self._reject_counts.pop(slot, None)
 
         self._kalman.prune(active_ids)
+        self._output_smoother.prune(active_ids)
         self._torso_corrector.prune(active_ids)
         self._leg_corrector.prune(active_ids)
         self._arm_corrector.prune(active_ids)
@@ -1518,7 +1582,7 @@ class YoloPoseEngine:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    video = Config.PROJECT_ROOT / "sample" / "fencing2.mp4"
+    video = Config.PROJECT_ROOT / "sample" / "fencing.mp4"
 
     # --- Mode 1: YOLO pose model (one-pass, fastest) ---
     print("\n=== Mode: yolo_pose ===")
